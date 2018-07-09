@@ -100,17 +100,19 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
 var (
 	// main operation modes
-	testFiles  = flag.Bool("t", false, "include in-package test files in a directory")
-	xtestFiles = flag.Bool("x", false, "consider only external test files in a directory")
-	allErrors  = flag.Bool("e", false, "report all errors, not just the first 10")
-	verbose    = flag.Bool("v", false, "verbose mode")
-	compiler   = flag.String("c", defaultCompiler, "compiler used for installed packages (gc, gccgo, or source)")
+	testFiles     = flag.Bool("t", false, "include in-package test files in a directory")
+	xtestFiles    = flag.Bool("x", false, "consider only external test files in a directory")
+	autoFiles     = flag.Bool("a", true, "if the base file ends in _test.go, include xtest files, otherwise include in-package test files and normal files.")
+	allErrors     = flag.Bool("e", false, "report all errors, not just the first 10")
+	verbose       = flag.Bool("v", false, "verbose mode")
+	compiler      = flag.String("c", defaultCompiler, "compiler used for installed packages (gc, gccgo, or source)")
 	usePkgContext = flag.Bool("pkg-context", true, "check the entire package, but restrict errors to the given file")
 
 	// additional output control
@@ -239,11 +241,25 @@ func parseFiles(dir string, filenames []string) ([]*ast.File, error) {
 	return files, nil
 }
 
-func parseDir(dir string) ([]*ast.File, error) {
+func parseDir(dir string, filePath string) ([]*ast.File, error) {
 	ctxt := build.Default
 	pkginfo, err := ctxt.ImportDir(dir, 0)
 	if _, nogo := err.(*build.NoGoError); err != nil && !nogo {
 		return nil, err
+	}
+
+	// if this is a scoped file call, guess at if we need xtest files or not
+	if filePath != "" && *autoFiles {
+		if strings.HasSuffix(filePath, "_test.go") {
+			fileName := filepath.Base(filePath)
+			// this'll generally be short, so no sense building up a map
+			for _, otherFile := range pkginfo.XTestGoFiles {
+				if otherFile == fileName {
+					// this file is an xtest file, so check xtest files
+					return parseFiles(dir, pkginfo.XTestGoFiles)
+				}
+			}
+		}
 	}
 
 	if *xtestFiles {
@@ -275,13 +291,13 @@ func getPkgFiles(args []string, useContext bool) ([]*ast.File, string, error) {
 			return nil, "", err
 		}
 		if info.IsDir() {
-			files, err := parseDir(path)
+			files, err := parseDir(path, "")
 			return files, "", err
 		}
 
 		if useContext {
 			dirName := filepath.Dir(path)
-			files, err := parseDir(dirName)
+			files, err := parseDir(dirName, path)
 			return files, path, err
 		}
 	}
@@ -301,8 +317,8 @@ func checkPkgFiles(files []*ast.File, targetFile string) {
 
 	importer := &Importer{
 		mainImporter: importer.For(*compiler, nil).(types.ImporterFrom),
-		cwd: wd,
-		packages: make(map[string]*types.Package),
+		cwd:          wd,
+		packages:     make(map[string]*types.Package),
 	}
 
 	targetFile = filepath.Clean(targetFile)
