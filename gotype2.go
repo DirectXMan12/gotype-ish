@@ -56,6 +56,8 @@ The flags are:
 		compiler used for installed packages (gc, gccgo, or source); default: source
 	-pkg-context
 		consider the entire package when type checking, but only report errors for the given file; default: true
+	-w
+		consider the given directory as the working directory
 
 Flags controlling additional output:
 	-ast
@@ -114,6 +116,7 @@ var (
 	verbose       = flag.Bool("v", false, "verbose mode")
 	compiler      = flag.String("c", defaultCompiler, "compiler used for installed packages (gc, gccgo, or source)")
 	usePkgContext = flag.Bool("pkg-context", true, "check the entire package, but restrict errors to the given file")
+	workingDir    = flag.String("w", "", "use the given directory as the working directory (defaults to cwd)")
 
 	// additional output control
 	printAST      = flag.Bool("ast", false, "print AST (forces -seq)")
@@ -308,9 +311,13 @@ func getPkgFiles(args []string, useContext bool) ([]*ast.File, string, error) {
 }
 
 func checkPkgFiles(files []*ast.File, targetFile string) {
-	wd, err := os.Getwd()
-	if err != nil {
-		panic(err.Error())
+	wd := *workingDir
+	if wd == "" {
+		var err error
+		wd, err = os.Getwd()
+		if err != nil {
+			panic(err.Error())
+		}
 	}
 
 	type bailout struct{}

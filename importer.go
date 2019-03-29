@@ -28,7 +28,7 @@ func (i *Importer) ImportFrom(path, srcDir string, mode types.ImportMode) (*type
 	fullDir := pathpkg.Join(i.cwd, srcDir)
 	pkg, err := i.mainImporter.ImportFrom(path, fullDir, mode)
 	if err != nil {
-		buildPkg, err := build.Default.Import(path, fullDir, build.AllowBinary)
+		buildPkg, err := build.Default.Import(path, fullDir, 0 /* No `AllowBinary` because it messes with modules */)
 		if err != nil {
 			return nil, err
 		}
