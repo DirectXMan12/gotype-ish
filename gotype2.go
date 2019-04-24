@@ -92,60 +92,23 @@ package main
 import (
 	"flag"
 	"fmt"
-	"go/ast"
-	"go/build"
-	"go/importer"
-	"go/parser"
-	"go/scanner"
-	"go/token"
-	"go/types"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"time"
+
+	"golang.org/x/tools/go/packages"
 )
 
 var (
 	// main operation modes
-	testFiles     = flag.Bool("t", false, "include in-package test files in a directory")
-	xtestFiles    = flag.Bool("x", false, "consider only external test files in a directory")
 	autoFiles     = flag.Bool("a", true, "if the base file ends in _test.go, include xtest files, otherwise include in-package test files and normal files.")
-	allErrors     = flag.Bool("e", false, "report all errors, not just the first 10")
-	verbose       = flag.Bool("v", false, "verbose mode")
-	compiler      = flag.String("c", defaultCompiler, "compiler used for installed packages (gc, gccgo, or source)")
 	usePkgContext = flag.Bool("pkg-context", true, "check the entire package, but restrict errors to the given file")
 	workingDir    = flag.String("w", "", "use the given directory as the working directory (defaults to cwd)")
-
-	// additional output control
-	printAST      = flag.Bool("ast", false, "print AST (forces -seq)")
-	printTrace    = flag.Bool("trace", false, "print parse trace (forces -seq)")
-	parseComments = flag.Bool("comments", false, "parse comments (ignored unless -ast or -trace is provided)")
 )
 
 var (
-	fset       = token.NewFileSet()
 	errorCount = 0
-	sequential = false
-	parserMode parser.Mode
 )
-
-func initParserMode() {
-	if *allErrors {
-		parserMode |= parser.AllErrors
-	}
-	if *printAST {
-		sequential = true
-	}
-	if *printTrace {
-		parserMode |= parser.Trace
-		sequential = true
-	}
-	if *parseComments && (*printAST || *printTrace) {
-		parserMode |= parser.ParseComments
-	}
-}
 
 const usageString = `usage: gotype [flags] [path ...]
 
@@ -182,135 +145,44 @@ func usage() {
 
 func report(err error, pathRestriction string) {
 	if pathRestriction != "" {
-		if typeError, isTypeError := err.(types.Error); isTypeError && typeError.Fset != nil {
-			targetFile := filepath.Clean(typeError.Fset.File(typeError.Pos).Name())
-			if targetFile != pathRestriction {
+		if pkgErr, isPkgErr := err.(packages.Error); isPkgErr {
+			errFileParts := strings.Split(pkgErr.Pos, ":")
+			errFilePath := errFileParts[0]
+			if errFilePath != pathRestriction {
 				return
 			}
 		}
 	}
-	scanner.PrintError(os.Stderr, err)
-	if list, ok := err.(scanner.ErrorList); ok {
-		errorCount += len(list)
-		return
-	}
+	fmt.Fprintln(os.Stderr, err)
 	errorCount++
 }
 
-// parse may be called concurrently
-func parse(filename string, src interface{}) (*ast.File, error) {
-	if *verbose {
-		fmt.Println(filename)
-	}
-	file, err := parser.ParseFile(fset, filename, src, parserMode) // ok to access fset concurrently
-	if *printAST {
-		ast.Print(fset, file)
-	}
-	return file, err
-}
-
-func parseStdin() (*ast.File, error) {
-	src, err := ioutil.ReadAll(os.Stdin)
-	if err != nil {
-		return nil, err
-	}
-	return parse("<standard input>", src)
-}
-
-func parseFiles(dir string, filenames []string) ([]*ast.File, error) {
-	files := make([]*ast.File, len(filenames))
-	errors := make([]error, len(filenames))
-
-	var wg sync.WaitGroup
-	for i, filename := range filenames {
-		wg.Add(1)
-		go func(i int, filepath string) {
-			defer wg.Done()
-			files[i], errors[i] = parse(filepath, nil)
-		}(i, filepath.Join(dir, filename))
-		if sequential {
-			wg.Wait()
-		}
-	}
-	wg.Wait()
-
-	// if there are errors, return the first one for deterministic results
-	for _, err := range errors {
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return files, nil
-}
-
-func parseDir(dir string, filePath string) ([]*ast.File, error) {
-	ctxt := build.Default
-	pkginfo, err := ctxt.ImportDir(dir, 0)
-	if _, nogo := err.(*build.NoGoError); err != nil && !nogo {
-		return nil, err
-	}
-
-	// if this is a scoped file call, guess at if we need xtest files or not
-	if filePath != "" && *autoFiles {
-		if strings.HasSuffix(filePath, "_test.go") {
-			fileName := filepath.Base(filePath)
-			// this'll generally be short, so no sense building up a map
-			for _, otherFile := range pkginfo.XTestGoFiles {
-				if otherFile == fileName {
-					// this file is an xtest file, so check xtest files
-					return parseFiles(dir, pkginfo.XTestGoFiles)
-				}
-			}
-		}
-	}
-
-	if *xtestFiles {
-		return parseFiles(dir, pkginfo.XTestGoFiles)
-	}
-
-	filenames := append(pkginfo.GoFiles, pkginfo.CgoFiles...)
-	if *testFiles {
-		filenames = append(filenames, pkginfo.TestGoFiles...)
-	}
-	return parseFiles(dir, filenames)
-}
-
-func getPkgFiles(args []string, useContext bool) ([]*ast.File, string, error) {
-	if len(args) == 0 {
-		// stdin
-		file, err := parseStdin()
-		if err != nil {
-			return nil, "", err
-		}
-		return []*ast.File{file}, "", nil
-	}
-
+func getPkgFiles(args []string, useContext bool) (string, string, error) {
 	if len(args) == 1 {
 		// possibly a directory
 		path := args[0]
 		info, err := os.Stat(path)
 		if err != nil {
-			return nil, "", err
+			return "", "", err
 		}
 		if info.IsDir() {
-			files, err := parseDir(path, "")
-			return files, "", err
+			return path, "", nil
 		}
 
 		if useContext {
 			dirName := filepath.Dir(path)
-			files, err := parseDir(dirName, path)
-			return files, path, err
+			if strings.HasPrefix(path, "./") {
+				// filepath.Dir (via filepath.Clean) removes the leading ./
+				dirName = "./" + dirName
+			}
+			return dirName, path, nil
 		}
 	}
 
-	// list of files
-	files, err := parseFiles("", args)
-	return files, "", err
+	return "", "", fmt.Errorf("cannot specify more than one path")
 }
 
-func checkPkgFiles(files []*ast.File, targetFile string) {
+func checkPkgFiles(pkgPath, targetFile string) {
 	wd := *workingDir
 	if wd == "" {
 		var err error
@@ -320,79 +192,45 @@ func checkPkgFiles(files []*ast.File, targetFile string) {
 		}
 	}
 
-	type bailout struct{}
+	includeTests := *autoFiles && targetFile != "" && strings.HasSuffix(targetFile, "_test.go")
 
-	importer := &Importer{
-		mainImporter: importer.For(*compiler, nil).(types.ImporterFrom),
-		cwd:          wd,
-		packages:     make(map[string]*types.Package),
+	cfg := &packages.Config{
+		Dir: wd,
+		Mode: packages.LoadTypes,
+		Tests: includeTests,
 	}
 
-	targetFile = filepath.Clean(targetFile)
+	var err error
+	targetFile, err = filepath.Abs(targetFile)
+	if err != nil {
+		report(err, targetFile)
+		return
+	}
 
-	// if checkPkgFiles is called multiple times, set up conf only once
-	conf := types.Config{
-		FakeImportC: true,
-		Error: func(err error) {
-			if !*allErrors && errorCount >= 10 {
-				panic(bailout{})
-			}
+	roots, err := packages.Load(cfg, pkgPath)
+	if err != nil {
+		report(err, targetFile)
+		return
+	}
+	for _, root := range roots {
+		for _, err := range root.Errors {
 			report(err, targetFile)
-		},
-		Importer: importer,
-		Sizes:    SizesFor(build.Default.Compiler, build.Default.GOARCH),
-	}
-
-	importer.config = &conf
-
-	defer func() {
-		switch p := recover().(type) {
-		case nil, bailout:
-			// normal return or early exit
-		default:
-			// re-panic
-			panic(p)
 		}
-	}()
-
-	const path = "pkg" // any non-empty string will do for now
-	conf.Check(path, fset, files, nil)
-}
-
-func printStats(d time.Duration) {
-	fileCount := 0
-	lineCount := 0
-	fset.Iterate(func(f *token.File) bool {
-		fileCount++
-		lineCount += f.LineCount()
-		return true
-	})
-
-	fmt.Printf(
-		"%s (%d files, %d lines, %d lines/s)\n",
-		d, fileCount, lineCount, int64(float64(lineCount)/d.Seconds()),
-	)
+	}
 }
 
 func main() {
 	flag.Usage = usage
 	flag.Parse()
-	initParserMode()
 
-	start := time.Now()
-
-	files, targetFile, err := getPkgFiles(flag.Args(), *usePkgContext)
+	pkgPath, targetFile, err := getPkgFiles(flag.Args(), *usePkgContext)
 	if err != nil {
 		report(err, "")
 		os.Exit(2)
 	}
 
-	checkPkgFiles(files, targetFile)
+	checkPkgFiles(pkgPath, targetFile)
 	if errorCount > 0 {
 		os.Exit(2)
-	}
-
-	if *verbose {
-		printStats(time.Since(start))
 	}
 }
