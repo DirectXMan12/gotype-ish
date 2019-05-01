@@ -143,11 +143,38 @@ func usage() {
 	os.Exit(2)
 }
 
-func report(err error, pathRestriction string) {
+func report(err error, pathRestriction, cwd string) {
 	if pathRestriction != "" {
 		if pkgErr, isPkgErr := err.(packages.Error); isPkgErr {
 			errFileParts := strings.Split(pkgErr.Pos, ":")
 			errFilePath := errFileParts[0]
+			if errFilePath == "" && pkgErr.Pos == "" {
+				// for some reason, test package errors get double-wrapped
+				// an put in a list that we have to re-split
+				lines := strings.Split(pkgErr.Msg, "\n")
+				for _, line := range lines {
+					if line == "" {
+						continue
+					}
+
+					msgParts := strings.SplitN(line, ":", 4)
+					err := packages.Error{
+						Pos: strings.Join(msgParts[:len(msgParts)-1], ":"),
+						Msg: msgParts[len(msgParts)-1],
+					}
+					report(err, pathRestriction, cwd)
+				}
+				return
+			}
+			
+			if errFilePath != "" && filepath.IsAbs(pathRestriction) && !filepath.IsAbs(errFilePath) {
+				errFileParts[0] = filepath.Join(cwd, errFilePath)
+				errFilePath = errFileParts[0]
+
+				pkgErr.Pos = strings.Join(errFileParts, ":")
+				err = pkgErr
+			}
+
 			if errFilePath != pathRestriction {
 				return
 			}
@@ -203,18 +230,18 @@ func checkPkgFiles(pkgPath, targetFile string) {
 	var err error
 	targetFile, err = filepath.Abs(targetFile)
 	if err != nil {
-		report(err, targetFile)
+		report(err, targetFile, wd)
 		return
 	}
 
 	roots, err := packages.Load(cfg, pkgPath)
 	if err != nil {
-		report(err, targetFile)
+		report(err, targetFile, wd)
 		return
 	}
 	for _, root := range roots {
 		for _, err := range root.Errors {
-			report(err, targetFile)
+			report(err, targetFile, wd)
 		}
 	}
 }
@@ -225,7 +252,7 @@ func main() {
 
 	pkgPath, targetFile, err := getPkgFiles(flag.Args(), *usePkgContext)
 	if err != nil {
-		report(err, "")
+		report(err, "", "")
 		os.Exit(2)
 	}
 
